@@ -1,192 +1,125 @@
-IMPORT DAS BIBLIOTECAS
-############################
-import sys
-import time
-import boto3
-from awsglue.transforms import *
-from awsglue.utils import getResolvedOptions
-from pyspark.sql.functions import col, lit
-from pyspark.sql.types import StringType, FloatType, DateType, IntegerType
+import pytest
+from unittest.mock import patch, MagicMock
 from datetime import date
-from itaudatautils.data_utils import DataUtils
-from utils.funcoes import Funcoes
-import logging
+import sys
+import os
 
-Definindo log
-log = logging.getLogger('–> tb_xt3_spec_fato_alocacao_hf: ')
-log.setLevel(logging.DEBUG)
+# Adicione o diretório raiz do projeto ao Python path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, project_root)
 
-log.info(“==== Iniciando a execução do job ====”)
+from src.main import verifica_arquivo, cria_diretorio, recupera_arquivo, importa_dados, define_dtype, valida_regras_qualidade, grava_resultado_dq, alocacao_hf
+from src.funcoes import Funcoes # Assumindo que a classe Funcoes está definida aqui
 
-############################
+@pytest.fixture
+def setup_env():
+    s3_mock = MagicMock()
+    s3_resource_mock = MagicMock()
+    funcoes_mock = Funcoes(s3_mock, s3_resource_mock)
+    return funcoes_mock, "s3://input_path", "file.csv", "output_path"
 
-PARAMETROS
-############################
+@patch('src.main.Funcoes')
+def test_verifica_arquivo(MockFuncoes, setup_env):
+    funcoes_mock, S3_INPUT_PATH, S3_INPUT_NPS_FILE, _ = setup_env
+    MockFuncoes.return_value = funcoes_mock
 
-Lendo os parametros do Glue Job que serao utilizados
-log.info(“Capturando valor dos parametros do job.”)
-args = getResolvedOptions(sys.argv, ["S3_INPUT_PATH",
-"FILE_FORMAT",
-"S3_OUTPUT_PATH",
-"GLUE_OUTPUT_DATABASE",
-"GLUE_OUTPUT_DATABASE_QUALITY",
-"S3_INPUT_FILE",
-"GLUE_OUTPUT_TABLE_QUALITY",
-"S3_BUCKET_SOR"])
+    funcoes_mock.verifica_arquivo_s3.return_value = True
+    assert verifica_arquivo() == True
 
-############################
+    funcoes_mock.verifica_arquivo_s3.return_value = False
+    with pytest.raises(NameError, match=f"O arquivo '{S3_INPUT_NPS_FILE}' não existe no Bucket '{S3_INPUT_PATH}'. Favor providencias a cópia dos arquivos pra ele."):
+        verifica_arquivo()
 
-SPARK SESSION
-############################
+@patch('src.main.Funcoes')
+def test_cria_diretorio(MockFuncoes, setup_env):
+    funcoes_mock, _, _, S3_OUTPUT_PATH = setup_env
+    MockFuncoes.return_value = funcoes_mock
 
-Instanciando a spark session, utilizando o DataUtils
-datautils = DataUtils.get_spark()
-spark = datautils.engine.spark_session
-quality_engine = datautils.get_quality_engine()
-conn_catalog = datautils.get_catalog_connector()
-s3 = boto3.client(“s3”)
-s3_resource = boto3.resource(“s3”)
-funcoes = Funcoes(s3, s3_resource)
+    funcoes_mock.verifica_diretorio_existe.return_value = True
+    assert cria_diretorio() == None
 
-Configurando variaveis que serão utilizadas
-S3_INPUT_PATH = args[“S3_INPUT_PATH”]
-S3_INPUT_NPS_FILE = args[“S3_INPUT_FILE”]
-S3_FILE_FORMAT = args[“FILE_FORMAT”]
-S3_OUTPUT_PATH = args[“S3_OUTPUT_PATH”]
-GLUE_OUTPUT_DATABASE = args[“GLUE_OUTPUT_DATABASE”]
-GLUE_OUTPUT_DATABASE_QUALITY = args[“GLUE_OUTPUT_DATABASE_QUALITY”]
-GLUE_OUTPUT_TABLE_QUALITY = args[“GLUE_OUTPUT_TABLE_QUALITY”]
-S3_BUCKET_SOR = args[“S3_BUCKET_SOR”]
-PATH_DESTINO = “s3://” + args[
-"S3_OUTPUT_PATH"] + "/" + GLUE_OUTPUT_DATABASE # "s3://itau-corp-spec-sa-east-1-64221676680
+    funcoes_mock.verifica_diretorio_existe.return_value = False
+    cria_diretorio()
+    funcoes_mock.cria_diretorio.assert_called_with('tb_xt3_spec_fato_alocacao_hf', S3_OUTPUT_PATH)
 
-JOB_NAME = “tb_xt3_spec_fato_alocacao_hf”
+@patch('src.main.Funcoes')
+def test_recupera_arquivo(MockFuncoes, setup_env):
+    funcoes_mock, S3_INPUT_PATH, _, _ = setup_env
+    MockFuncoes.return_value = funcoes_mock
 
-db_destino_quality = “db_corp_repositoriosdedados_sgit_sor_01”
-tb_destino_quality = “dataquality_metrics”
-today = date.today()
+    funcoes_mock.recupera_arquivo_mais_atual_bucket.return_value = "latest_file.csv"
+    arquivo = recupera_arquivo()
+    assert arquivo == f"s3://{S3_INPUT_PATH}/latest_file.csv"
 
-def alocacao_hf():
-try:
+@patch('src.main.Funcoes')
+@patch('src.main.spark')
+def test_importa_dados(mock_spark, MockFuncoes, setup_env):
+    funcoes_mock, _, S3_INPUT_NPS_FILE, _ = setup_env
+    MockFuncoes.return_value = funcoes_mock
 
-    if not funcoes.verifica_arquivo_s3(S3_INPUT_PATH, S3_INPUT_NPS_FILE):
-        raise NameError(
-            f"O arquivo '{S3_INPUT_NPS_FILE}' não existe no Bucket '{S3_INPUT_PATH}'. Favor providencias a cópia dos arquivos pra ele.")
+    df_mock = MagicMock()
+    mock_spark.read.option.return_value.csv.return_value = df_mock
+    df_mock.rdd.isEmpty.return_value = False
 
-    ################################################################################
-    if not funcoes.verifica_diretorio_existe(S3_OUTPUT_PATH, 'tb_xt3_spec_fato_alocacao_hf'):
-        log.info(f"Criando novo diretorio do processo no S3: '{PATH_DESTINO}'")
-        funcoes.cria_diretorio('tb_xt3_spec_fato_alocacao_hf', S3_OUTPUT_PATH)
+    result = importa_dados(S3_INPUT_NPS_FILE)
+    assert result == df_mock
 
-    ################################################################################
-    arquivo_mais_atual_envio = funcoes.recupera_arquivo_mais_atual_bucket(S3_FILE_FORMAT
-                                                                    , S3_INPUT_PATH
-                                                                    , S3_INPUT_NPS_FILE)
+    df_mock.rdd.isEmpty.return_value = True
+    with pytest.raises(NameError, match="O processo não conseguiu encontrar os dados."):
+        importa_dados(S3_INPUT_NPS_FILE)
 
-    arquivo_mais_atual_envio = f"s3://{S3_INPUT_PATH}/{arquivo_mais_atual_envio}"
-    print(arquivo_mais_atual_envio)
+def test_define_dtype():
+    df_mock = MagicMock()
+    result = define_dtype(df_mock)
+    assert result == df_mock
+
+@patch('src.main.QualityEngine')
+def test_valida_regras_qualidade(MockQualityEngine):
+    df_mock = MagicMock()
+    quality_engine_mock = MockQualityEngine.return_value
+    quality_engine_mock.run_evaluate.return_value = MagicMock()
     
+    result = valida_regras_qualidade(df_mock)
+    assert result == quality_engine_mock.run_evaluate.return_value
 
+@patch('src.main.ConnCatalog')
+def test_grava_resultado_dq(MockConnCatalog):
+    result_mock = MagicMock()
+    result_mock.get_df.return_value = MagicMock()
+    result_mock.is_rules_successful.return_value = True
 
-    log.info(f"Importando os dados dos arquivos para DataFrame spark.")
-#fazer todo o de para das colunas de envio e de resposta
-#procurar caron pros testes de data quality
-#salvar observabilyt – usar referencia gustavo
+    conn_catalog_mock = MockConnCatalog.return_value
+    assert grava_resultado_dq(result_mock) == True
+    conn_catalog_mock.put_df_to_table.assert_called()
 
-    cgitgluealocacaohf = spark.read.option("inferSchema", True).option("header", True).option("delimiter", "|").option(
-        "encoding", "latin1").csv(arquivo_mais_atual_envio)
+@patch('src.main.verifica_arquivo')
+@patch('src.main.cria_diretorio')
+@patch('src.main.recupera_arquivo')
+@patch('src.main.importa_dados')
+@patch('src.main.define_dtype')
+@patch('src.main.valida_regras_qualidade')
+@patch('src.main.grava_resultado_dq')
+@patch('builtins.print')
+def test_alocacao_hf(mock_print, mock_grava, mock_valida, mock_define, mock_importa, mock_recupera, mock_cria, mock_verifica):
+    mock_verifica.return_value = True
+    mock_recupera.return_value = "s3://input_path/latest_file.csv"
+    mock_importa.return_value = MagicMock()
+    mock_define.return_value = MagicMock()
+    mock_valida.return_value = MagicMock()
+    mock_grava.return_value = True
 
-    if cgitgluealocacaohf.rdd.isEmpty():
-        raise NameError("O processo não conseguiu encontrar os dados.")
+    alocacao_hf()
 
-    log.info("Definindo dtype das colunas do DataFrame Spark")
-    
-    print(arquivo_mais_atual_envio)
-    cgitgluealocacaohf.show()
-    
-    cgitgluealocacaohf = cgitgluealocacaohf \
-        .withColumn("cod_re", cgitgluealocacaohf["cod_re"].cast(StringType())) \
-        .withColumn("cod_pre", cgitgluealocacaohf["cod_pre"].cast(StringType())) \
-        .withColumn("cod_comunidade", cgitgluealocacaohf["cod_comunidade"].cast(StringType())) \
-        .withColumn("cod_releasetrain", cgitgluealocacaohf["cod_releasetrain"].cast(StringType())) \
-        .withColumn("cod_squad", cgitgluealocacaohf["cod_squad"].cast(StringType())) \
-        .withColumn("des_especialidade", cgitgluealocacaohf["des_especialidade"].cast(StringType())) \
-        .withColumn("cod_fornecedor", cgitgluealocacaohf["cod_fornecedor"].cast(StringType())) \
-        .withColumn("cod_are", cgitgluealocacaohf["cod_are"].cast(StringType())) \
-        .withColumn("des_status_alocacao", cgitgluealocacaohf["des_status_alocacao"].cast(StringType())) \
-        .withColumn("qtd_horasplanejadas", cgitgluealocacaohf["qtd_horasplanejadas"].cast(FloatType())) \
-        .withColumn("dt_inicio_alocacao", cgitgluealocacaohf["dt_inicio_alocacao"].cast(DateType())) \
-        .withColumn("dt_fim_alocacao", cgitgluealocacaohf["dt_fim_alocacao"].cast(DateType())) \
-        .withColumn("cod_funcional", cgitgluealocacaohf["cod_funcional"].cast(StringType())) \
-        .withColumn("des_nome", cgitgluealocacaohf["des_nome"].cast(StringType())) \
-        .withColumn("num_cpf", cgitgluealocacaohf["num_cpf"].cast(StringType())) \
-        .withColumn("dt_criacao", cgitgluealocacaohf["dt_criacao"].cast(DateType())) \
-        .withColumn("dt_atualizacao", cgitgluealocacaohf["dt_atualizacao"].cast(DateType())) \
-        .withColumn("dt_ref", cgitgluealocacaohf["dt_ref"].cast(DateType())) \
-        .withColumn("dt_processamento", cgitgluealocacaohf["dt_processamento"].cast(DateType())) \
-      
-    log.info("Iniciando a validação das regras de QD...")
+    mock_verifica.assert_called_once()
+    mock_cria.assert_called_once()
+    mock_recupera.assert_called_once()
+    mock_importa.assert_called_once()
+    mock_define.assert_called_once()
+    mock_valida.assert_called_once()
+    mock_grava.assert_called_once()
+    mock_print.assert_called()
 
-    # Regras de Qualidade de Dados
-    log.info("Aplicando regras de qualidade de dados.")
-    rulesets = {
-    'rules': [
-        'IsPrimaryKey "cod_re"',
-        'ColumnExists "cod_funcional"',
-        'ColumnExists "cod_pre"',
-        'IsComplete "cod_funcional"',
-        'ColumnExists "cod_pre"'
-        ],
-    
-    'database_name': GLUE_OUTPUT_DATABASE,
-    'table_name': 'tb_xt3_spec_fato_alocacao_hf',
-    'partition': 'n/a'
-    
-    }
-
-    # Valida regra de qualidade a partir do dataframe
-    result = quality_engine.run_evaluate(
-        dataframe=cgitgluealocacaohf,
-        rulesets=rulesets
-    )
-    
-    log.info("Coloca o resultado DQ DataFrame")
-    df_result_dq = result.get_df()
-    log.info(f"Resultado do DQ: {df_result_dq.show()}")
-
-    # Gravando df na tabela de qualidade
-    log.info(f"Grava resultado DQ na tabela de QD '{db_destino_quality + '.' + tb_destino_quality}'.")
-    conn_catalog.put_df_to_table(
-        dataframe=df_result_dq,
-        database=db_destino_quality,
-        table=tb_destino_quality,
-        write_mode='append'
-    )
-
-    if result.is_rules_successful():
-
-        log.info("Teste DQ passou com sucesso!")
-
-        # Montar o dataframe com o resultado do data quality
-
-    else:
-
-        log.info("Teste DQ falhou. Veja os detalhes a seguir.")
-
-    # Escrever DataFrame spark em uma tabela
-    log.info("Gravando os dados processados pelo job na tabela do catalogo local.")
-    conn_catalog.put_df_to_table(
-        dataframe=cgitgluealocacaohf,
-        database=GLUE_OUTPUT_DATABASE,
-        table='tb_xt3_spec_fato_alocacao_hf',
-        write_mode='append',
-        format='parquet',
-        compression='snappy',
-        repartition=1
-    )
-    log.info("O processamento foi finalizado com sucesso!")
-
-except Exception as e:
-
-    raise e
-funcoes.observability(alocacao_hf, “tb_xt3_spec_fato_alocacao_hf”, JOB_NAME)
+    # Teste para o caso de falha na gravação
+    mock_grava.return_value = False
+    with pytest.raises(Exception, match="Falha ao gravar os resultados da qualidade dos dados"):
+        alocacao_hf()
